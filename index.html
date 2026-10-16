@@ -172,6 +172,7 @@ button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid var(-
   <div class="wrap">
     <div class="tools">
       <button class="tog" id="labelsTog" aria-pressed="true">Note names</button>
+      <button class="tog fallonly" id="tidyTog" aria-pressed="true" hidden>Tidy timing</button>
       <div class="seg fallonly" role="group" aria-label="Which hand">
         <button data-hands="left"><span class="dot l"></span>Left</button>
         <button data-hands="both">Both</button>
@@ -250,7 +251,7 @@ var ICON={"chevron-left": "<path fill=\"none\" stroke=\"currentColor\" stroke-li
 function ico(n,sz){sz=sz||22;return '<svg class="ic" width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24" aria-hidden="true">'+ICON[n]+'</svg>';}
 
 /* ---------- small preferences ---------- */
-var prefs={labels:true,lyrics:true,sound:true,speed:1,size:'m',zoom:window.innerWidth<600?0.7:1,view:'fall',hands:'both',fallWin:3,dragSeen:false,lyricsUp:false};
+var prefs={labels:true,lyrics:true,sound:true,speed:1,size:'m',zoom:window.innerWidth<600?0.7:1,view:'fall',hands:'both',fallWin:3,dragSeen:false,lyricsUp:false,tidy:true};
 try{var saved=JSON.parse(localStorage.getItem('pianoSheetsPrefs')||'null');if(saved)for(var k in saved)prefs[k]=saved[k];}catch(e){}
 function savePrefs(){try{localStorage.setItem('pianoSheetsPrefs',JSON.stringify(prefs));}catch(e){}}
 
@@ -564,6 +565,71 @@ function time(p,B){
 return {last:function(){return LAST;},OPT:OPT,envelope:envelope,envelopeFromNotes:envelopeFromNotes,analyse:analyse,pos:pos,time:time,FPS:FPS};
 })();
 
+/* ---------- tidy the detected notes: drop ghosts, line chords up, snap to the beat ---------- */
+var Tidy=(function(){
+var OPT={mergeGap:0.02,mergeQuieter:0.95,chordTol:0.05,chordFrac:0.14,align:0.03,alignOn:true,subs:[1,2,3,4],subPen:[0,0.006,0.012,0.010],snapD:true};
+function byStart(a,b){return a.s-b.s||a.p-b.p;}
+/* 1. clean: a held note that the detector re-strikes (starts the moment the last copy ends, and quieter) is one note */
+function clean(notes){
+  var ns=notes.map(function(n){return {p:n.p,s:n.s,d:n.d,v:n.v==null?0.6:n.v};}).sort(byStart),out=[],last={};
+  ns.forEach(function(n){
+    var prev=last[n.p];
+    if(prev&&n.s-(prev.s+prev.d)<=OPT.mergeGap&&n.v<OPT.mergeQuieter*prev.v){prev.d=Math.max(prev.d,n.s+n.d-prev.s);return;}
+    out.push(n);last[n.p]=n;
+  });
+  return out;
+}
+/* 2. notes that start almost together become one chord, placed on the attack heard in the audio */
+function chords(notes,beats,E){
+  var ns=notes.slice().sort(byStart),i=0,groups=[];
+  while(i<ns.length){
+    var t0=ns[i].s,ibi=localIbi(beats,t0),tol=Math.min(OPT.chordTol,ibi*OPT.chordFrac),g=[ns[i]],j=i+1;
+    while(j<ns.length&&ns[j].s-t0<=tol){g.push(ns[j]);j++;}
+    var w=0,ws=0;g.forEach(function(n){w+=n.v;ws+=n.v*n.s;});var t=ws/w;
+    if(E&&OPT.alignOn)t=alignToAttack(t,E);
+    g.forEach(function(n){var end=n.s+n.d;n.s=t;n.d=Math.max(0.05,end-t);});
+    groups.push(g);i=j;
+  }
+  return ns;
+}
+function localIbi(B,t){
+  if(!B||B.length<2)return 0.5;var a=0,b=B.length-1;
+  if(t<=B[0])return B[1]-B[0];if(t>=B[b])return B[b]-B[b-1];
+  while(b-a>1){var m=(a+b)>>1;if(B[m]<=t)a=m;else b=m;}return B[a+1]-B[a];
+}
+function alignToAttack(t,E){
+  var fps=E.fps,t0=E.t0||0,env=E.env,c=Math.round((t-t0)*fps),r=Math.round(OPT.align*fps),best=-1,bi=-1;
+  for(var f=c-r;f<=c+r;f++){if(f<1||f>=env.length-1)continue;if(env[f]>=env[f-1]&&env[f]>=env[f+1]&&env[f]>best){best=env[f];bi=f;}}
+  if(bi<0)return t;
+  var lo=Math.max(0,c-40),hi=Math.min(env.length,c+40),m=0;for(var k=lo;k<hi;k++)m+=env[k];m/=(hi-lo)||1;
+  return best>1.5*m?bi/fps+t0:t;
+}
+/* 3. snap onto the beat: each beat is split in 1, 2, 3 or 4, whichever fits the notes in it best */
+function snap(notes,beats){
+  var B=beats;if(!B||B.length<2)return notes.map(function(n){return {p:n.p,s:n.s,d:n.d,v:n.v};});
+  var pos=Rhythm.pos,time=Rhythm.time,byBeat=new Map();
+  notes.forEach(function(n){var q=pos(n.s,B),k=Math.floor(q+0.5/4);(byBeat.get(k)||byBeat.set(k,[]).get(k)).push(q-k);});
+  var subOf=new Map();
+  byBeat.forEach(function(fr,k){
+    var best=1e9,bs=4;
+    OPT.subs.forEach(function(sd,ix){var err=0;fr.forEach(function(f){var x=f*sd;err+=Math.abs(x-Math.round(x))/sd;});
+      var sc=err/fr.length+OPT.subPen[ix];if(sc<best){best=sc;bs=sd;}});
+    subOf.set(k,bs);
+  });
+  function snapPos(q){var k=Math.floor(q+0.125),sd=subOf.get(k)||4;return k+Math.round((q-k)*sd)/sd;}
+  function snapEnd(q){var k=Math.floor(q),sd=subOf.get(k)||subOf.get(k-1)||4;return k+Math.round((q-k)*sd)/sd;}
+  var out=notes.map(function(n){
+    var qs=snapPos(pos(n.s,B)),qe=pos(n.s+n.d,B);
+    if(OPT.snapD){var se=snapEnd(qe);qe=se<=qs?qs+1/(subOf.get(Math.floor(qs))||4):se;}
+    var s=time(qs,B);return {p:n.p,s:s,d:Math.max(0.05,time(qe,B)-s),v:n.v};
+  }).sort(byStart);
+  /* no overlapping copies of the same key */
+  var last={};out.forEach(function(n){var pr=last[n.p];if(pr&&pr.s+pr.d>n.s)pr.d=Math.max(0.04,n.s-pr.s);last[n.p]=n;});
+  return out.filter(function(n,i){return !(i>0&&out[i-1].p===n.p&&Math.abs(out[i-1].s-n.s)<1e-4);});
+}
+return {OPT:OPT,clean:clean,chords:chords,snap:snap,tidy:function(notes,beats,E){return chords(clean(notes),beats,E);}};
+})();
+
 /* ---------- notes -> MusicXML ---------- */
 var TYPES={16:['whole',0],12:['half',1],8:['half',0],6:['quarter',1],4:['quarter',0],3:['eighth',1],2:['eighth',0],1:['16th',0]};
 var VALUES=[16,12,8,6,4,3,2,1];
@@ -752,15 +818,17 @@ function addAudioFile(file){
     return listen(mono,frames,onsets,function(p){busy('Listening to the song','Working out the notes: '+Math.round(p*100)+'%',0.08+p*span);})
       .then(function(){return nextFrame();})
       .then(function(){
-        var raw=L.noteFramesToTime(L.outputToNotesPoly(frames,onsets,0.5,0.3,11,true,null,null,true));
+        var raw=L.noteFramesToTime(L.outputToNotesPoly(frames,onsets,0.6,0.3,11,true,null,null,true));
         var notes=raw.map(function(n){return {p:n.pitchMidi,s:n.startTimeSeconds,d:n.durationSeconds,v:n.amplitude};})
           .filter(function(n){return n.p>=28&&n.p<=96;});
+        notes=Tidy.clean(notes);
         if(notes.length<2)throw new Error('No clear notes were found in this recording.');
         busy('Finding the beat','Lining the notes up with the beat',0.92);
         var r=null;try{if(E)r=Rhythm.analyse(E,notes);}catch(e){console.warn('Beat finding failed',e);}
+        notes=Tidy.chords(notes,r?r.beats:null,E);
         var first=Math.min.apply(null,notes.map(function(n){return n.s;}));
         notes.forEach(function(n){n.s-=first;});
-        var song={id:newId(),title:baseName(file),kind:'gen',source:'From audio',unit:'sec',notes:notes,first:r3(first),added:Date.now()};
+        var song={id:newId(),title:baseName(file),kind:'gen',source:'From audio',unit:'sec',notes:notes,first:r3(first),tidy:2,added:Date.now()};
         applyTiming(song,r,first,2);
         if(!wantWords){song.words=[];return store.put(song).then(function(){return song;});}
         return transcribeLyrics(mono).then(function(words){
@@ -781,15 +849,23 @@ function useBackend(name){
   if(name==='wasm')pre=(tf.wasm?Promise.resolve():loadScript(TF_WASM_DIR+'tf-backend-wasm.min.js')).then(function(){tf.wasm.setWasmPaths(TF_WASM_DIR);});
   return pre.then(function(){return tf.setBackend(name);}).then(function(ok){if(ok===false)throw new Error(name+' is not available');return tf.ready();});
 }
+var bpCache={};
 function listen(mono,frames,onsets,progress){
   var L=window.BasicPitchLib,order=(window.PianoSheets.backends||['webgl','wasm','cpu']).slice();
   function attempt(){
     var name=order.shift();frames.length=0;onsets.length=0;
     return useBackend(name).then(function(){
-      var bp=new L.BasicPitch(MODEL_URL);
+      /* one copy of the model per backend, and every working tensor freed afterwards,
+         so importing song after song does not run the device out of memory */
+      var bp=bpCache[name]||(bpCache[name]=new L.BasicPitch(MODEL_URL));
       bp.prepareData=function(audio){return Promise.resolve([frameAudio(audio),audio.length]);};
-      return bp.evaluateModel(mono,function(f,o){for(var i=0;i<f.length;i++){frames.push(f[i]);onsets.push(o[i]);}},progress);
+      return Promise.resolve(bp.model).then(function(){
+        var eng=window.tf.engine();eng.startScope();
+        return bp.evaluateModel(mono,function(f,o){for(var i=0;i<f.length;i++){frames.push(f[i]);onsets.push(o[i]);}},progress)
+          .then(function(r){eng.endScope();return r;},function(e){eng.endScope();throw e;});
+      });
     }).then(function(){window.PianoSheets.usedBackend=name;},function(e){
+      if(bpCache[name])delete bpCache[name];
       console.warn('Listening failed with '+name,e);
       if(!order.length)throw new Error('The notes could not be worked out on this device.');
       return attempt();
@@ -858,7 +934,12 @@ function openSong(song){
   $('#arr').hidden=song.kind!=='gen';$('#arr').open=false;
   $('#lyricsTog').hidden=!(song.words&&song.words.length);
   sheetFor=null;player.steps=[];player.idx=0;
-  if(song.kind==='gen'&&song.unit==='sec'&&!song.beatTimes){retime(song);store.put(song);}
+  if(song.kind==='gen'&&song.unit==='sec'&&!song.tidy){
+    song.notes=Tidy.clean(song.notes);
+    if(!song.beatTimes)retime(song);
+    song.notes=Tidy.chords(song.notes,song.beatTimes,null);
+    song.tidy=2;store.put(song);
+  }else if(song.kind==='gen'&&song.unit==='sec'&&!song.beatTimes){retime(song);store.put(song);}
   buildFall(false);
   syncControls();applyView();
 }
@@ -885,6 +966,8 @@ function syncControls(){
   $('#soundTog').innerHTML=ico(prefs.sound?'volume-2':'volume-x',20);
   $('#soundTog').setAttribute('aria-label',prefs.sound?'Sound on':'Sound off');
   document.querySelectorAll('[data-hands]').forEach(function(b){b.setAttribute('aria-pressed',String(b.dataset.hands===prefs.hands));});
+  $('#tidyTog').setAttribute('aria-pressed',String(!!prefs.tidy));
+  $('#tidyTog').hidden=!(current&&current.kind==='gen'&&current.unit==='sec');
   $('#spdVal').textContent=Math.round(prefs.speed*100)+'%';
   if(current&&current.kind==='gen'){
     var a=current.arr;
@@ -1179,8 +1262,9 @@ function buildFall(keep){
   fall.ready=false;fall.error=false;
   if(!s){fall.notes=[];return;}
   if(s.kind==='gen'){
-    var k=s.unit==='sec'?1:60/(s.bpm||100);
-    s.notes.forEach(function(n){notes.push({m:n.p,s:n.s*k,d:Math.max(n.d*k,0.06),h:n.p>=60?0:1,v:n.v==null?0.7:n.v});});
+    var k=s.unit==='sec'?1:60/(s.bpm||100),src=s.notes;
+    if(s.unit==='sec'&&s.beatTimes&&prefs.tidy){try{src=Tidy.snap(s.notes,beatList(s));}catch(e){console.warn('Tidy timing failed',e);}}
+    src.forEach(function(n){notes.push({m:n.p,s:n.s*k,d:Math.max(n.d*k,0.06),h:n.p>=60?0:1,v:n.v==null?0.7:n.v});});
     var a=s.arr||{},beats=a.beats||4,shift=a.shift||0;
     var endT=notes.reduce(function(m,n){return Math.max(m,n.s+n.d);},0);
     if(s.unit==='sec'&&s.beatTimes){
@@ -1417,6 +1501,7 @@ $('#spdUp').addEventListener('click',function(){speedBy(0.1);});
 $('#lyricsTog').addEventListener('click',function(){prefs.lyrics=!prefs.lyrics;savePrefs();syncControls();render();});
 $('#labelsTog').addEventListener('click',function(){prefs.labels=!prefs.labels;savePrefs();syncControls();addLabels();fallDraw();});
 $('#viewFall').addEventListener('click',function(){setView('fall');});
+$('#tidyTog').addEventListener('click',function(){var was=fall.playing;if(was)fallStop();prefs.tidy=!prefs.tidy;savePrefs();syncControls();buildFall(true);if(was)fallStart();});
 $('#viewSheet').addEventListener('click',function(){setView('sheet');});
 document.querySelectorAll('[data-hands]').forEach(function(b){b.addEventListener('click',function(){prefs.hands=b.dataset.hands;savePrefs();syncControls();fallDraw();});});
 function fallZoom(f){prefs.fallWin=Math.min(10,Math.max(1.2,Math.round(prefs.fallWin*f*100)/100));savePrefs();fallDraw();}
@@ -1502,7 +1587,7 @@ window.addEventListener('resize',function(){
 });
 
 window.addEventListener('orientationchange',function(){setTimeout(function(){if(current)fallSize();},300);});
-window.PianoSheets={buildXml:buildXml,parseMidi:parseMidi,estimateTempo:estimateTempo,player:player,piano:piano,cleanWords:cleanWords,fall:fall,Rhythm:Rhythm,sheetMap:sheetMap,beatList:beatList,songXml:songXml};
+window.PianoSheets={buildXml:buildXml,parseMidi:parseMidi,estimateTempo:estimateTempo,player:player,piano:piano,cleanWords:cleanWords,fall:fall,Rhythm:Rhythm,Tidy:Tidy,sheetMap:sheetMap,beatList:beatList,songXml:songXml};
 showCatalogue();
 })();
 </script>
